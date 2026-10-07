@@ -27,7 +27,7 @@ from inspect_ai.model._chat_message import (
 )
 from inspect_ai.model._generate_config import GenerateConfig
 from inspect_ai.model._model_call import ModelCall
-from inspect_ai.model._model_output import ModelFallback, ModelOutput
+from inspect_ai.model._model_output import ModelFallback, ModelOutput, ModelUsage
 from inspect_ai.scorer._metric import Score
 
 
@@ -922,3 +922,79 @@ def test_reconstruct_prefers_limit_event_matching_summary() -> None:
     assert sample.limit is not None
     assert sample.limit.type == "message"
     assert sample.limit.limit == 50.0
+
+
+def test_reconstruct_model_usage_from_events_when_summary_empty() -> None:
+    """Buffer summaries record no usage; rebuild it from ModelEvent usage."""
+    summary = _make_in_progress_summary()  # model_usage/role_usage empty
+
+    user_msg = ChatMessageUser(content="Q")
+    event1 = ModelEvent(
+        model="mockllm/model",
+        role="main",
+        input=[user_msg],
+        tools=[],
+        tool_choice="auto",
+        config=GenerateConfig(),
+        output=ModelOutput(
+            model="mockllm/model",
+            usage=ModelUsage(input_tokens=10, output_tokens=5, total_tokens=15),
+        ),
+    )
+    event2 = ModelEvent(
+        model="mockllm/model",
+        role="main",
+        input=[user_msg],
+        tools=[],
+        tool_choice="auto",
+        config=GenerateConfig(),
+        output=ModelOutput(
+            model="mockllm/model",
+            usage=ModelUsage(input_tokens=20, output_tokens=7, total_tokens=27),
+        ),
+    )
+
+    sample_data = SampleData(
+        events=[
+            _event_to_event_data(event1, id=1, sample_id="2"),
+            _event_to_event_data(event2, id=2, sample_id="2"),
+        ],
+        attachments=[],
+    )
+
+    sample = reconstruct_eval_sample(summary, sample_data, cancelled=True)
+
+    assert sample.model_usage != {}
+    usage = sample.model_usage["mockllm/model"]
+    assert usage.input_tokens == 30
+    assert usage.output_tokens == 12
+    assert usage.total_tokens == 42
+    assert sample.role_usage["main"].total_tokens == 42
+
+
+def test_reconstruct_keeps_summary_usage_when_present() -> None:
+    """A buffer summary that did record usage stays authoritative."""
+    summary = _make_completed_summary()
+    summary.model_usage = {
+        "mockllm/model": ModelUsage(input_tokens=50, output_tokens=20, total_tokens=70)
+    }
+
+    event = ModelEvent(
+        model="mockllm/model",
+        input=[ChatMessageUser(content="Q")],
+        tools=[],
+        tool_choice="auto",
+        config=GenerateConfig(),
+        output=ModelOutput(
+            model="mockllm/model",
+            usage=ModelUsage(input_tokens=10, output_tokens=5, total_tokens=15),
+        ),
+    )
+    sample_data = SampleData(
+        events=[_event_to_event_data(event, id=1)],
+        attachments=[],
+    )
+
+    sample = reconstruct_eval_sample(summary, sample_data)
+
+    assert sample.model_usage["mockllm/model"].total_tokens == 70

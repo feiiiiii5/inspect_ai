@@ -535,6 +535,118 @@ async def test_e2e_recovery_crash_before_first_flush() -> None:
                 buffer.cleanup()
 
 
+async def test_e2e_recovery_rebuilds_model_usage_from_events() -> None:
+    """Buffer summary rows carry no usage; recovery must rebuild it from ModelEvents."""
+    async with AsyncFilesystem():
+        with tempfile.TemporaryDirectory() as temp_dir:
+            eval_path = os.path.join(temp_dir, "usage.eval")
+            output_path = os.path.join(temp_dir, "usage-recovered.eval")
+
+            eval_spec = _make_eval_spec(num_samples=1)
+            plan = EvalPlan()
+            log_start = LogStart(version=LOG_SCHEMA_VERSION, eval=eval_spec, plan=plan)
+
+            zip_log = ZipLogFile(eval_path)
+            await zip_log.init(log_start=None, summary_counter=0, summaries=[])
+            await zip_log.start(log_start)
+            await zip_log.flush()
+
+            db_dir = os.path.join(temp_dir, "bufferdb")
+            buffer = SampleBufferDatabase(eval_path, create=True, db_dir=Path(db_dir))
+            try:
+                started = EvalSampleSummary(
+                    id=1,
+                    epoch=1,
+                    input="Question 1",
+                    target="2",
+                    started_at=datetime.now(timezone.utc).isoformat(),
+                )
+                buffer.start_sample(started)
+
+                def _event_with_usage(content: str, usage: ModelUsage) -> ModelEvent:
+                    return ModelEvent(
+                        model="mockllm/model",
+                        input=[ChatMessageUser(content="What is 1+1?")],
+                        tools=[],
+                        tool_choice="auto",
+                        config=GenerateConfig(),
+                        output=ModelOutput(model="mockllm/model", usage=usage),
+                    )
+
+                buffer.log_events(
+                    [
+                        SampleEvent(
+                            id=1,
+                            epoch=1,
+                            event=_event_with_usage(
+                                "1",
+                                ModelUsage(
+                                    input_tokens=10,
+                                    output_tokens=5,
+                                    total_tokens=15,
+                                ),
+                            ),
+                        )
+                    ]
+                )
+                buffer.log_events(
+                    [
+                        SampleEvent(
+                            id=1,
+                            epoch=1,
+                            event=_event_with_usage(
+                                "2",
+                                ModelUsage(
+                                    input_tokens=20,
+                                    output_tokens=7,
+                                    total_tokens=27,
+                                ),
+                            ),
+                        )
+                    ]
+                )
+
+                completed = EvalSampleSummary(
+                    id=1,
+                    epoch=1,
+                    input="Question 1",
+                    target="2",
+                    scores={"accuracy": Score(value="C", answer="2")},
+                    started_at=datetime.now(timezone.utc).isoformat(),
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+                buffer.complete_sample(completed, sample_metadata=None)
+
+                _simulate_crashed_buffer(buffer)
+
+                log = await recover_eval_log_async(
+                    eval_path, output=output_path, cleanup=False, _db_dir=db_dir
+                )
+
+                assert log.samples is not None
+                assert len(log.samples) == 1
+                sample = log.samples[0]
+                assert sample.model_usage
+                usage = sample.model_usage["mockllm/model"]
+                assert usage.input_tokens == 30
+                assert usage.output_tokens == 12
+                assert usage.total_tokens == 42
+
+                assert log.stats is not None
+                assert "mockllm/model" in log.stats.model_usage
+                assert log.stats.model_usage["mockllm/model"].total_tokens == 42
+
+                read_log = await read_eval_log_async(output_path)
+                assert read_log.samples is not None
+                assert (
+                    read_log.samples[0].model_usage["mockllm/model"].total_tokens == 42
+                )
+                assert read_log.stats is not None
+                assert read_log.stats.model_usage["mockllm/model"].total_tokens == 42
+            finally:
+                buffer.cleanup()
+
+
 async def test_e2e_recovery_duplicate_samples_in_buffer_and_eval() -> None:
     """Test recovery when buffer DB has samples that were also flushed to .eval.
 

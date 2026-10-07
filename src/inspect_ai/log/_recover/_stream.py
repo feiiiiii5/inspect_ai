@@ -46,6 +46,7 @@ from ._reconstruct import (
     IncompleteAction,
     MessageAccumulator,
     _summary_with_uuid_fallback,
+    _usage_or_reconstructed,
     in_progress_sample_error,
     recovered_sample_limit,
 )
@@ -249,6 +250,8 @@ def _write_sample_streaming(
             resolved_events = resolve_model_event_calls(resolved_events, call_pool)
             accumulator.process_events(resolved_events)
 
+            model_usage, role_usage = _usage_or_reconstructed(summary, resolved_events)
+
             stream.write(b',"events":[')
             if include_events and raw_events:
                 condensed = [
@@ -325,8 +328,8 @@ def _write_sample_streaming(
             # Store: parity with DB recovery path (defaults to {}).
             _write_json_field(stream, "store", {}, comma=True)
 
-            _write_json_field(stream, "model_usage", summary.model_usage, comma=True)
-            _write_json_field(stream, "role_usage", summary.role_usage, comma=True)
+            _write_json_field(stream, "model_usage", model_usage, comma=True)
+            _write_json_field(stream, "role_usage", role_usage, comma=True)
             _write_json_field(
                 stream, "model_fallbacks", summary.model_fallbacks, comma=True
             )
@@ -372,6 +375,11 @@ def _write_sample_streaming(
         attachments.close()
 
     summary.completed = True
+    # Buffer summaries are recorded at sample start and carry no usage; the
+    # rebuilt values (see above) must also reach the stats accumulator and the
+    # in-memory summary index in write_recovered_eval_log.
+    summary.model_usage = model_usage
+    summary.role_usage = role_usage
 
     # Deliberately NOT back-filling `summary.limit` from `limit_value` for an
     # in-progress sample. Its buffered summary is the start-of-sample one, so it

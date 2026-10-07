@@ -34,7 +34,7 @@ from inspect_ai.log._recorders.buffer.types import (
     SampleData,
 )
 from inspect_ai.model._chat_message import ChatMessage
-from inspect_ai.model._model_output import ModelOutput
+from inspect_ai.model._model_output import ModelOutput, ModelUsage
 
 logger = getLogger(__name__)
 
@@ -209,6 +209,8 @@ def reconstruct_eval_sample(
 
     messages, output = _extract_messages_from_events(events)
 
+    model_usage, role_usage = _usage_or_reconstructed(summary, events)
+
     attachments = {
         attachment.hash: attachment.content for attachment in sample_data.attachments
     }
@@ -239,8 +241,8 @@ def reconstruct_eval_sample(
         events=events if include_events else [],
         timelines=None,
         attachments=attachments,
-        model_usage=summary.model_usage,
-        role_usage=summary.role_usage,
+        model_usage=model_usage,
+        role_usage=role_usage,
         model_fallbacks=summary.model_fallbacks,
         turn_count=summary.turn_count,
         token_limit=summary.token_limit,
@@ -430,6 +432,57 @@ def _extract_messages_from_events(
     acc = MessageAccumulator()
     acc.process_events(events)
     return acc.result()
+
+
+def _usage_or_reconstructed(
+    summary: EvalSampleSummary, events: list[Event]
+) -> tuple[dict[str, ModelUsage], dict[str, ModelUsage]]:
+    """The sample's usage dicts, rebuilt from ModelEvents when the summary lacks them.
+
+    Buffer DB summaries are written at sample start and never carry usage, so a
+    sample recovered from the buffer has ``model_usage == {}`` even though its
+    ModelEvents (like the live sample) recorded ``output.usage``. Rebuild the
+    same per-model / per-role rollups the live path accumulated so recovered
+    samples tally their real cost. A summary that does name usage stays
+    authoritative.
+    """
+    model_usage = summary.model_usage
+    role_usage = summary.role_usage
+    if model_usage and role_usage:
+        return model_usage, role_usage
+    from_events_model, from_events_role = _usage_from_events(events)
+    if not model_usage:
+        model_usage = from_events_model
+    if not role_usage:
+        role_usage = from_events_role
+    return model_usage, role_usage
+
+
+def _usage_from_events(
+    events: list[Event],
+) -> tuple[dict[str, ModelUsage], dict[str, ModelUsage]]:
+    """Sum ``ModelEvent.output.usage`` per model name and per role."""
+    model_usage: dict[str, ModelUsage] = {}
+    role_usage: dict[str, ModelUsage] = {}
+    for event in events:
+        if not isinstance(event, ModelEvent):
+            continue
+        usage = event.output.usage if event.output is not None else None
+        if usage is None:
+            continue
+        model_name = event.model or event.output.model
+        if not model_name:
+            continue
+        _add_usage(model_usage, model_name, usage)
+        if event.role is not None:
+            _add_usage(role_usage, event.role, usage)
+    return model_usage, role_usage
+
+
+def _add_usage(
+    usage_by_key: dict[str, ModelUsage], key: str, usage: ModelUsage
+) -> None:
+    usage_by_key[key] = usage_by_key.get(key, ModelUsage()) + usage
 
 
 def _segment_messages(model_event: ModelEvent) -> list[ChatMessage]:
